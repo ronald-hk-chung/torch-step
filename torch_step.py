@@ -9,7 +9,6 @@ from pathlib import Path
 from copy import copy, deepcopy
 from tqdm.auto import tqdm
 from typing import Callable, Type
-from sklearn.model_selection import train_test_split
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -23,7 +22,39 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import LambdaLR
 import torchinfo
 from PIL import Image
-from sklearn.model_selection import train_test_split
+
+
+class TSImageDataset(Dataset):
+    """Torch Utils Dataset class to create datasets for image data
+
+    Args:
+      paths[list]: list of image paths
+      labels[list]: list of image labels
+      classes[list]: list of classes from labels, Default to None which will be induced from labels
+      transforms[transforms.Compose]: transformation of image, Default to ToTensor()
+    """
+
+    def __init__(
+        self,
+        paths: list,
+        labels: list,
+        classes: list = None,
+        transforms: transforms.Compose = T.Compose(
+            [T.ToImage(), T.ToDtype(torch.float32, scale=True)]
+        ),
+    ):
+        self.paths = paths
+        self.labels = labels
+        self.classes = classes if classes else sorted(list(set(self.labels)))
+        self.transforms = transforms
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        return self.transforms(Image.open(self.paths[idx])), self.classes.index(
+            self.labels[idx]
+        )
 
 
 def get_pretrained_model(name: str, pretrained_weights: str | None = None):
@@ -82,7 +113,9 @@ def get_pretrained_model(name: str, pretrained_weights: str | None = None):
         )
     else:
         weights = None
-        forward_transforms = T.Compose([T.ToImageTensor(), T.ConverImageDtype()])
+        forward_transforms = T.Compose(
+            [T.ToImage(), T.ToDtype(torch.float32, scale=True)]
+        )
         reverse_transforms = T.ToPILImage()
 
     # Get model using torchvision.models.get_model
@@ -91,43 +124,22 @@ def get_pretrained_model(name: str, pretrained_weights: str | None = None):
     return model, forward_transforms, reverse_transforms
 
 
-class TSImageBlock:
-    def __init__(
-        self,
-        batch_size: int,
-        train_paths: list,
-        train_labels: list,
-        valid_paths: list = None,
-        valid_labels: list = None,
-        valid_split: float = None,
-        type="SingleLabelClassification",
-    ):
-        self.batch_size = batch_size
-        self.type = type
-        if valid_split is not None:
-            (
-                self.train_paths,
-                self.valid_paths,
-                self.train_labels,
-                self.valid_labels,
-            ) = train_test_split(train_paths, train_labels, test_size=valid_split)
-        else:
-            self.train_paths = train_paths
-            self.valid_paths = valid_paths
-            self.train_labels = train_labels
-            self.valid_labels = valid_labels
-
-        if self.type == "SingleLabelClassification":
-            self.classes = sorted(list(set(train_labels)))
-            self.y_train = [self.classes.index(label) for label in self.train_labels]
-            self.y_valid = (
-                [self.classes.index(label) for label in self.valid_labels]
-                if (self.valid_labels is not None and self.valid_paths is not None)
-                else None
-            )
+def show_batch(
+    dataloader: torch.utils.data.DataLoader,
+    classes: list,
+    transforms: transforms.Compose = T.ToPILImage(),
+):
+    fig = plt.figure(figsize=(20, 10))
+    imgs, labels = next(iter(dataloader))
+    nrows, ncolumns = 4, 8
+    for i, label in enumerate(labels):
+        plt.subplot(nrows, ncolumns, i + 1)
+        plt.imshow(transforms(imgs[i]))
+        plt.title(classes[label])
+        plt.axis(False)
 
 
-class TSVision:
+class TSEngine:
     """
     TorchStep class contains a number of useful functions for Pytorch Vision Model Training
     """
@@ -135,55 +147,18 @@ class TSVision:
     def __init__(
         self,
         model: torch.nn.Module,
-        optimizier: torch.optim.Optimizer,
+        optim: tuple[torch.optim.Optimizer, dict[str, float]],
         loss_fn: torch.nn.Module,
-        acc_fn: list[tuple[str, Callable]] | None = None,
+        train_dataloader: torch.utils.data.DataLoader,
+        valid_dataloader: torch.utils.data.DataLoader,
+        metric_fn: Callable | None = None,
     ):
-        self.model = model
-        self.datablock = datablock
-        self.train_dataset = self.TSDataset(
-            X=self.datablock.train_paths,
-            y=self.datablock.y_train,
-            forward_transforms=self.forward_transforms,
-        )
-        self.train_dataloader = DataLoader(
-            dataset=self.train_dataset,
-            batch_size=self.datablock.batch_size,
-            shuffle=True,
-            num_workers=os.cpu_count(),
-            pin_memory=True,
-        )
-        if self.datablock.y_valid is not None:
-            self.valid_dataset = self.TSDataset(
-                X=self.datablock.valid_paths,
-                y=self.datablock.y_valid,
-                forward_transforms=self.forward_transforms,
-            )
-            self.valid_dataloader = DataLoader(
-                dataset=self.valid_dataset,
-                batch_size=self.datablock.batch_size,
-                shuffle=False,
-                num_workers=os.cpu_count(),
-                pin_memory=True,
-            )
-        else:
-            self.valid_dataset = None
-            self.valid_dataloader = None
-
-        self.model.classifier[-1] = nn.Linear(
-            in_features=self.model.classifier[-1].in_features,
-            out_features=len(self.datablock.classes),
-        )
-
-        self.optimizer = optimizer
-
+        self.model = deepcopy(model)
+        self.optimizer = optim[0](params=self.model.parameters(), **optim[1])
         self.loss_fn = loss_fn
-        if acc_fn is None:
-            self.acc_fn = self.accuracy
-            self.acc_fn_name = "Accuracy"
-        else:
-            self.acc_fn = acc_fn[1]
-            self.acc_fn_name = acc_fn_name[0]
+        self.metric_fn = metric_fn if metric_fn else self.accuracy
+        self.train_dataloader = train_dataloader
+        self.valid_dataloader = valid_dataloader
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model.to(self.device)
         self.writer = None
@@ -192,9 +167,9 @@ class TSVision:
         self.clipping = None
         self.results = {
             "train_loss": [],
-            "train_acc": [],
+            "train_metric": [],
             "valid_loss": [],
-            "valid_acc": [],
+            "valid_metric": [],
         }
         self.learning_rates = []
         self.total_epochs = 0
@@ -203,21 +178,8 @@ class TSVision:
             self.PrintResults,
             self.TBWriter,
             self.LearningRateScheduler,
+            self.GradientClipping,
         ]
-
-    class TSDataset(Dataset):
-        def __init__(self, X, y, forward_transforms):
-            self.X = X
-            self.y = y
-            self.forward_transforms = forward_transforms
-
-        def __len__(self):
-            return len(self.X)
-
-        def __getitem__(self, idx):
-            features = self.forward_transforms(Image.open(self.X[idx]))
-            targets = self.y[idx]
-            return features, targets
 
     @staticmethod
     def accuracy(y_logits, y):
@@ -238,7 +200,7 @@ class TSVision:
     def set_loaders(
         self,
         train_dataloader: torch.utils.data.DataLoader,
-        valid_dataloader: torch.utils.data.DataLoader | None = None,
+        valid_dataloader: torch.utils.data.DataLoader,
     ):
         self.train_dataloader = train_dataloader
         self.valid_dataloader = valid_dataloader
@@ -246,16 +208,15 @@ class TSVision:
     def train_step(self):
         self.model.train()
         self.callback_handler.on_epoch_begin(self)
-        train_loss, train_acc = 0, 0
+        train_loss, train_metric = 0, 0
         for batch, (X, y) in enumerate(self.train_dataloader):
             X, y = X.to(self.device), y.to(self.device)
             self.callback_handler.on_batch_begin(self)
             y_logits = self.model(X)
             loss = self.loss_fn(y_logits, y)
             self.callback_handler.on_loss_end(self)
-            train_loss += loss.item()
-            train_acc += self.acc_fn(y_logits, y)
-
+            train_loss += np.array(loss.item())
+            train_metric += np.array(self.metric_fn(y_logits, y))
             loss.backward()
             self.callback_handler.on_step_begin(self)
             self.optimizer.step()
@@ -263,38 +224,39 @@ class TSVision:
             self.optimizer.zero_grad()
             self.callback_handler.on_batch_end(self)
         train_loss /= len(self.train_dataloader)
-        train_acc /= len(self.train_dataloader)
-        return train_loss, train_acc
+        train_metric /= len(self.train_dataloader)
+        return train_loss, train_metric
 
     def valid_step(self):
         self.model.eval()
-        valid_loss, valid_acc = 0, 0
+        valid_loss, valid_metric = 0, 0
         with torch.inference_mode():
             for batch, (X, y) in enumerate(self.valid_dataloader):
                 X, y = X.to(self.device), y.to(self.device)
                 y_logits = self.model(X)
                 loss = self.loss_fn(y_logits, y)
-                valid_loss += loss.item()
-                valid_acc += self.acc_fn(y_logits, y)
+                valid_loss += np.array(loss.item())
+                valid_metric += np.array(self.metric_fn(y_logits, y))
         valid_loss /= len(self.valid_dataloader)
-        valid_acc /= len(self.valid_dataloader)
-        return valid_loss, valid_acc
+        valid_metric /= len(self.valid_dataloader)
+        return valid_loss, valid_metric
 
     def train(self, epochs: int):
         self.callback_handler.on_train_begin(self)
         for epoch in tqdm(range(epochs)):
             self.total_epochs += 1
-            train_loss, train_acc = self.train_step()
-            if self.valid_dataloader is not None:
-                valid_loss, valid_acc = self.valid_step()
-            else:
-                valid_loss, valid_acc = float("nan"), float("nan")
+            train_loss, train_metric = self.train_step()
+            valid_loss, valid_metric = self.valid_step()
             self.callback_handler.on_epoch_end(
                 self,
                 train_loss=train_loss,
-                train_acc=train_acc,
+                train_metric=train_metric
+                if isinstance(train_metric, np.ndarray)
+                else [train_metric],
                 valid_loss=valid_loss,
-                valid_acc=valid_acc,
+                valid_metric=valid_metric
+                if isinstance(valid_metric, np.ndarray)
+                else [valid_metric],
             )
 
     @staticmethod
@@ -451,12 +413,8 @@ class TSVision:
                     for param in module.parameters():
                         param.requires_grad = True
 
-    def set_optimizer(self, optimizer: torch.optim.Optimizer):
-        self.optimizer = optimizer
-
-    # def set_model(self,
-    #               model:nn.Module):
-    #   self.model = model
+    def set_optimizer(self, optim: tuple[torch.optim.Optimizer, dict[str, float]]):
+        self.optimizer = optim[0](params=self.model.parameters(), **optim[1])
 
     def predict(self, X: torch.Tensor) -> torch.Tensor:
         self.model.eval()
@@ -471,17 +429,9 @@ class TSVision:
             self.writer.add_graph(self.model, X.to(self.device))
 
     def plot_loss_curve(self):
-        plt.figure(figsize=(12, 6))
-        plt.subplot(1, 2, 1)
         plt.plot(self.results["train_loss"], label="Train Loss")
         plt.plot(self.results["valid_loss"], label="Valid Loss")
         plt.title("Loss")
-        plt.xlabel("Epochs")
-        plt.legend()
-        plt.subplot(1, 2, 2)
-        plt.plot(self.results["train_acc"], label="Train Accuracy")
-        plt.plot(self.results["valid_acc"], label="Valid Accuracy")
-        plt.title("Accuracy")
         plt.xlabel("Epochs")
         plt.legend()
 
@@ -530,10 +480,6 @@ class TSVision:
             for handle in self.clipping:
                 handle.remove()
         self.clipping = None
-
-    # def show_batch(self):
-    #   fig = plt.figure(figsize(20, 5))
-    #   for idx, pred_index
 
     class Callback:
         def __init__(self, **kwargs):
@@ -615,48 +561,44 @@ class TSVision:
             print(
                 f"Epoch: {self.total_epochs} "
                 + f"| LR: {np.array(self.learning_rates).mean():.1E} "
-                + f"| train_loss: {kwargs['train_loss']:.3f} "
-                + f"| train_acc: {kwargs['train_acc']:.3f} "
-                + (
-                    f"| valid_loss: {kwargs['valid_loss']:.3f} "
-                    if self.valid_dataloader is not None
-                    else ""
-                )
-                + (
-                    f"| valid_acc: {kwargs['valid_acc']:.3f} "
-                    if self.valid_dataloader is not None
-                    else ""
-                )
+                + f"| train_loss: {np.around(kwargs['train_loss'], 3)} "
+                + f"| valid_loss: {np.around(kwargs['valid_loss'], 3)} "
+                + f"| train_metric: {np.around(kwargs['train_metric'], 3)} "
+                + f"| valid_metric: {np.around(kwargs['valid_metric'], 3)} "
             )
             self.learning_rates = []
 
     class TBWriter(Callback):
         def on_epoch_end(self, **kwargs):
             if self.writer:
-                loss_scalars = {"train_loss": kwargs["train_loss"]}
-                acc_scalars = {"train_acc": kwargs["train_acc"]}
-                if self.valid_dataloader is not None:
-                    loss_scalars.update({"valid_loss": kwargs["valid_loss"]})
-                    acc_scalars.update({"valid_acc": kwargs["valid_acc"]})
+                loss_scalars = {
+                    "train_loss": kwargs["train_loss"],
+                    "valid_loss": kwargs["valid_loss"],
+                }
                 self.writer.add_scalars(
                     main_tag="loss",
                     tag_scalar_dict=loss_scalars,
                     global_step=self.total_epochs,
                 )
-                self.writer.add_scalars(
-                    main_tag="acc",
-                    tag_scalar_dict=acc_scalars,
-                    global_step=self.total_epochs,
-                )
+
+                for i, train_acc in enumerate(kwargs["train_metric"]):
+                    acc_scalars = {
+                        "train_metric": kwargs["train_metric"][i],
+                        "valid_metric": kwargs["valid_metric"][i],
+                    }
+                    self.writer.add_scalars(
+                        main_tag=f"metric_{i}",
+                        tag_scalar_dict=acc_scalars,
+                        global_step=self.total_epochs,
+                    )
                 self.writer.close()
 
     class SaveResults(Callback):
         def on_epoch_end(self, **kwargs):
             self.results["train_loss"].append(kwargs["train_loss"])
-            self.results["train_acc"].append(kwargs["train_acc"])
-            if self.valid_dataloader is not None:
-                self.results["valid_loss"].append(kwargs["valid_loss"])
-                self.results["valid_acc"].append(kwargs["valid_acc"])
+            self.results["train_metric"].append(kwargs["train_metric"])
+            self.results["valid_loss"].append(kwargs["valid_loss"])
+            self.results["valid_metric"].append(kwargs["valid_metric"])
 
     class LearningRateScheduler(Callback):
         def on_batch_end(self, **kwargs):
@@ -675,3 +617,8 @@ class TSVision:
                     self.scheduler.step(kwargs["valid_loss"])
                 else:
                     self.scheduler.step()
+
+    class GradientClipping(Callback):
+        def on_step_begin(self, **kwargs):
+            if callable(self.clipping):
+                self.clipping()
