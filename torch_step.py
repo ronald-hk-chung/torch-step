@@ -77,18 +77,14 @@ def get_pretrained_model(name: str, pretrained_weights: str | None = None):
 
 
 def show_batch(dataloader: torch.utils.data.DataLoader,
-               transforms: transforms.Compose = T.ToPILImage(),
-               labelling: Callable = None):
+               transforms: transforms.Compose = T.ToPILImage()):
   fig = plt.figure(figsize=(20, 10))
   imgs, *labels = next(iter(dataloader))
   nrows, ncolumns = 4, 8
   for i, label in enumerate(list(zip(*labels))):
     plt.subplot(nrows, ncolumns, i + 1)
     plt.imshow(transforms(imgs[i]))
-    if labelling is None:
-      plt.title(list(map(lambda x: round(x.item(), 2), label)))
-    else:
-      plt.title(labelling(label))
+    plt.title(list(map(lambda x: round(x.item(), 2), label)))
     plt.axis(False)
 
 
