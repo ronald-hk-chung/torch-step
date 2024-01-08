@@ -198,7 +198,7 @@ def get_cam(img_path: str,
 
   # Plot out original image and image with heatmap
   fig, (ax1, ax2) = plt.subplots(1,2)
-  ax1.imshow(rtfms_resnet34(img))
+  ax1.imshow(rtfms(img))
   ax1.axis(False)
   overlay = to_pil_image(heatmap.detach(), mode='F').resize((img.shape[1],img.shape[2]), 
                                                             resample=Image.BICUBIC)
