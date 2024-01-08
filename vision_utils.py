@@ -15,6 +15,7 @@ from torchvision.transforms.functional import to_pil_image
 from matplotlib import colormaps
 from typing import Callable, Type
 from pathlib import Path
+import requests
 
 def get_pretrained_model(name: str, pretrained_weights: str | None = None):
   """Get pretrained model and pretrained transformation (forward and reverse)
