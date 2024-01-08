@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 from torchvision.transforms.functional import to_pil_image
 from matplotlib import colormaps
+from typing import Callable, Type
 
 def get_pretrained_model(name: str, pretrained_weights: str | None = None):
   """Get pretrained model and pretrained transformation (forward and reverse)
