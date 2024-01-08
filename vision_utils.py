@@ -204,7 +204,7 @@ def get_cam(img_path: str,
                                                             resample=Image.BICUBIC)
   cmap = colormaps['jet']
   overlay = (255 * cmap(np.asarray(overlay) ** 2)[:, :, :3]).astype(np.uint8)
-  ax2.imshow(rtfms_resnet34(img))
+  ax2.imshow(rtfms(img))
   ax2.imshow(overlay, alpha=0.4, interpolation='nearest')
   ax2.axis(False)
   plt.show()
