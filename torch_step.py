@@ -26,84 +26,22 @@ import torchinfo
 from PIL import Image
 
 
-def get_pretrained_model(name: str, pretrained_weights: str | None = None):
-  """Get pretrained model and pretrained transformation (forward and reverse)
-
-  Args:
-  model[str]: name of pretrained model
-  weights[str]: name of pretrained model weights
-
-  Returns:
-  A tuple of (model, forward_transformation, reverse_transformation)
-
-  Example usage:
-  model, forward_transformation, reverse_transformation = \
-    get_prerained_model(name='resnet18',
-              weights='ResNet18_Weights.IMAGENET1K_V1')
-  """
-
-  # Change get_state_dict from Torch Hub
-  def get_state_dict_from_hub(self, *args, **kwargs):
-    kwargs.pop("check_hash")
-    return torch.hub.load_state_dict_from_url(self.url, *args, **kwargs)
-  torchvision.models._api.WeightsEnum.get_state_dict = get_state_dict_from_hub
-
-  # Get default transformation and re-construct forward transformation and reverse transformation using V2
-  if pretrained_weights is not None:
-    weights = torchvision.models.get_weight(pretrained_weights)
-    pretrained_transforms = weights.transforms()
-    forward_transforms = T.Compose([T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)]),
-                                    T.Resize(size=pretrained_transforms.resize_size,
-                                             interpolation=pretrained_transforms.interpolation,
-                                             antialias=True),
-                                    T.CenterCrop(size=pretrained_transforms.crop_size),
-                                    T.Normalize(mean=pretrained_transforms.mean, std=pretrained_transforms.std)
-                                    ])
-    reverse_transforms = T.Compose([T.Normalize(mean=[0.0] * 3,
-                                                std=list(map(lambda x: 1 / x, pretrained_transforms.std))),
-                                    T.Normalize(mean=list(map(lambda x: -x, pretrained_transforms.mean)),
-                                                std=[1.0] * 3),
-                                    T.ToPILImage()
-                                    ])
-  else:
-    weights = None
-    forward_transforms = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])
-    reverse_transforms = T.ToPILImage()
-
-  # Get model using torchvision.models.get_model
-  model = torchvision.models.get_model(name=name, weights=weights)
-
-  return model, forward_transforms, reverse_transforms
-
-
-def show_batch(dataloader: torch.utils.data.DataLoader,
-               transforms: transforms.Compose = T.ToPILImage()):
-  fig = plt.figure(figsize=(20, 10))
-  imgs, *labels = next(iter(dataloader))
-  nrows, ncolumns = 4, 8
-  for i, label in enumerate(list(zip(*labels))):
-    plt.subplot(nrows, ncolumns, i + 1)
-    plt.imshow(transforms(imgs[i]))
-    plt.title(list(map(lambda x: round(x.item(), 2), label)))
-    plt.axis(False)
-
-
 class TSEngine:
   """
-  TorchStep class contains a number of useful functions for Pytorch Vision Model Training
+  TorchStep class contains a number of useful functions for Pytorch Model Training
   """
 
   def __init__(self,
                model: torch.nn.Module,
                optim: tuple[torch.optim.Optimizer, dict[str, float]],
                loss_fn: torch.nn.Module,
+               metric_fn: Callable,
                train_dataloader: torch.utils.data.DataLoader,
-               valid_dataloader: torch.utils.data.DataLoader,
-               metric_fn: Callable | None = None):
+               valid_dataloader: torch.utils.data.DataLoader):
     self.model = deepcopy(model)
     self.optimizer = optim[0](params=self.model.parameters(), **optim[1])
     self.loss_fn = loss_fn
-    self.metric_fn = metric_fn if metric_fn else self.accuracy
+    self.metric_fn = metric_fn
     self.train_dataloader = train_dataloader
     self.valid_dataloader = valid_dataloader
     self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -118,6 +56,10 @@ class TSEngine:
                     "valid_metric": []}
     self.learning_rates = []
     self.total_epochs = 0
+    self.modules = list(self.model.named_modules())
+    self.layers = {name: layer for name, layer in self.modules[1:]}
+    self.forward_hook_handles = []
+    self.backward_hook_handles = []
     self.callbacks = [self.SaveResults,
                       self.PrintResults,
                       self.TBWriter,
@@ -125,11 +67,11 @@ class TSEngine:
                       self.GradientClipping]
 
   @staticmethod
-  def accuracy(y_logits, y):
-    return (y_logits.argmax(dim=1) == y).sum().item() / len(y_logits)
-
-  @staticmethod
   def set_seed(seed=42):
+    """Function to set random seed for torch, numpy and random
+    
+    Args: seed [int]: random_seed
+    """
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -139,12 +81,22 @@ class TSEngine:
   def set_tensorboard(self,
                       name: str,
                       folder: str = "runs"):
+    """Method to set TSEngine tensorboard
+    
+    Args:
+      name [str]: name of project
+      folder [str]: name of folder to run tensorboard logs, Defaults to 'runs'
+    """
     suffix = datetime.datetime.now().strftime("%Y%m%d")
     self.writer = SummaryWriter(f"{folder}/{name}_{suffix}")
 
   def set_loaders(self,
                   train_dataloader: torch.utils.data.DataLoader,
                   valid_dataloader: torch.utils.data.DataLoader):
+    """Method to set dataloaders
+    
+    Args: train_dataloader, valid_dataloader
+    """
     self.train_dataloader = train_dataloader
     self.valid_dataloader = valid_dataloader
 
@@ -187,6 +139,10 @@ class TSEngine:
     return valid_loss, valid_metric
 
   def train(self, epochs: int):
+    """Method for TSEngine to run train and valid loops
+    
+    Args: epochs [int]: num of epochs to run
+    """
     self.callback_handler.on_train_begin(self)
     for epoch in tqdm(range(epochs)):
       self.total_epochs += 1
@@ -203,6 +159,7 @@ class TSEngine:
                  end_lr: float,
                  num_iter: int,
                  step_mode: str = "exp"):
+    """Method to generate learning rate function (internal only)"""
     if step_mode == "linear":
       factor = (end_lr / start_lr - 1) / num_iter
       def lr_fn(iteration):
@@ -215,6 +172,10 @@ class TSEngine:
 
   def set_lr(self,
              lr: float):
+    """Method to set learning rate
+    
+    Args: lr [float]: learning rate
+    """
     for g in self.optimizer.param_groups:
       g["lr"] = lr
 
@@ -225,6 +186,22 @@ class TSEngine:
                     step_mode: str = "exp",
                     alpha: float = 0.05,
                     show_graph: bool = True):
+    """Method to perform LR Range Test
+    Reference: Leslie N. Smith 'Cyclical Learning Rates for Training Neual Networks'
+
+    Args:
+      end_lr [float]: upper boundary for the LR Range test
+      start_lr [float]: lower boundary for the LR Range test, Defaults to current optimizer LR
+      num_iter [int]: number of interations to move from start_lr to end_lr
+      step_mode [str]: show LR range test linear or log scale, Defaults to 'exp' 
+      alpha [float]: alpha term for smoothed loss (smooth_loss = alpha * loss + (1-alpha) * prev_loss)
+      show_graph [bool]: to show LR Range Test result in plot
+
+    Return:
+      max_grad_lr [float]: LR with maximum loss gradient (steepest)
+      min_loss_lr [float]: LR with minium loss (minimum)
+
+    """
     previous_states = {"model": deepcopy(self.model.state_dict()),
                        "optimizer": deepcopy(self.optimizer.state_dict())}
     if start_lr is not None: self.set_lr(start_lr)
@@ -274,6 +251,10 @@ class TSEngine:
       return max_grad_lr, min_loss_lr
 
   def save_checkpoint(self, filename: str):
+    """Method to save model checkpoint
+    
+    Args: filename [str]: filename in pt/pth of model, e.g. 'model_path/model.pt'
+    """
     checkpoint = {"epoch": self.total_epochs,
                   "model_state_dict": self.model.state_dict(),
                   "optimizer_state_dict": self.optimizer.state_dict(),
@@ -281,6 +262,10 @@ class TSEngine:
     torch.save(checkpoint, filename)
 
   def load_checkpoint(self, filename: str):
+    """Method to load model checkpoint
+    
+    Args: file path of checkpoint to load in pt/pth format, e.g. 'model_path/model.pt'
+    """
     checkpoint = torch.load(filename)
     self.model.load_state_dict(checkpoint["model_state_dict"])
     self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -289,6 +274,12 @@ class TSEngine:
     self.model.train()
 
   def set_lr_scheduler(self, scheduler, is_batch_lr_scheduler=False):
+    """Method to set LR scheduler
+    
+    Args:
+      scheduler [torch.optim.scheduler]
+      is_batch_lr_scheduler [bool]: True for batch scheduler, False for epoch scheduler
+    """
     self.scheduler = scheduler
     self.is_batch_lr_scheduler = is_batch_lr_scheduler
 
@@ -296,6 +287,22 @@ class TSEngine:
                  col_names: list[str] = ["input_size", "output_size", "num_params", "trainable"],
                  col_width: int = 20,
                  row_settings: list[str] = ["var_names"]):
+    """Method to utilise torchinfo to shwo model summary
+    Reference: https://github.com/TylerYep/torchinfo
+
+    Args:
+      col_names (Iterable[str]): Specify which columns to show in the output
+        Currently supported: ("input_size",
+                              "output_size",
+                              "num_params",
+                              "params_percent",
+                              "kernel_size",
+                              "mult_adds",
+                              "trainable")
+        Default: ["input_size", "output_size", "num_params", "trainable"]
+
+      col_width (int): Width of each column. Default: 20
+    """
     print(torchinfo.summary(model=self.model,
                             input_size=next(iter(self.train_dataloader))[0].shape,
                             verbose=0,
@@ -304,6 +311,10 @@ class TSEngine:
                             row_settings=row_settings))
 
   def freeze(self, layers: list[str] = None):
+    """Method to change requires_grad to False for layers
+    
+    Args: layers [list[str]]: list of layers to freeze, freeze all if None
+    """
     if layers is None:
       layers = [name for name, module in self.model.named_modules() if "." not in name]
 
@@ -314,6 +325,10 @@ class TSEngine:
             param.requires_grad = False
 
   def unfreeze(self, layers: list[str] = None):
+    """Method to change requires_grad to True for layers
+    
+    Args: layers [list[str]]: list of layers to unfreeze, unfreeze all if None
+    """
     if layers is None:
       layers = [name for name, module in self.model.named_modules() if "." not in name]
 
@@ -324,9 +339,16 @@ class TSEngine:
             param.requires_grad = True
 
   def set_optimizer(self, optim: tuple[torch.optim.Optimizer, dict[str, float]]):
+    """Method to set optimizer
+    
+    Args:
+      optim [tuple[torch.optim.Opimizer, dictionary of parameters]]
+      Example usage: optim=(torch.optim.Adam, {'lr': 1e-3})
+    """
     self.optimizer = optim[0](params=self.model.parameters(), **optim[1])
 
   def predict(self, X: torch.Tensor):
+    """Method for TSEngine to predict in inference_mode"""
     self.model.eval()
     with torch.inference_mode():
       y_logits = self.model(X)
@@ -334,11 +356,13 @@ class TSEngine:
     return y_logits
 
   def add_graph(self):
+    """Method to add graph for TensorBoard"""
     if self.train_dataloader and self.writer:
       X, y = next(iter(self.train_dataloader))
       self.writer.add_graph(self.model, X.to(self.device))
 
   def plot_loss_curve(self):
+    """Method to plot loss curve"""
     plt.plot(self.results["train_loss"], label="Train Loss")
     plt.plot(self.results["valid_loss"], label="Valid Loss")
     plt.title("Loss")
@@ -346,12 +370,31 @@ class TSEngine:
     plt.legend()
 
   def fit_one_cycle(self, epochs, max_lr=None, min_lr=None):
-    max_grad_lr, min_loss_lr = self.lr_range_test(end_lr=1,
-                                                  num_iter=100,
-                                                  step_mode="exp",
-                                                  show_graph=False)
-    if max_lr is None: max_lr = min_loss_lr
-    if min_lr is None: min_lr = max_grad_lr
+    """Method to perform fit one cycle polcy 
+    Reference: https://pytorch.org/docs/stable/generated/torch.optim.lr_scheduler.OneCycleLR.html
+    Reference: https://arxiv.org/abs/1708.07120
+
+    Sets the learning rate of each parameter group according to the 1cycle learning rate policy. 
+    The 1cycle policy anneals the learning rate from an initial learning rate to some maximum learning rate 
+    and then from that maximum learning rate to some minimum learning rate
+
+    Args:
+      epochs [int]: The number of epochs to train for
+      max_lr [float]: Upper learning rate boundaries in the cycle for each parameter group
+      min_lr [float]: Lower learning rate boundaries in the cycle for each parameter group
+
+      if max_lr and min_lr is not specified,
+      lr_range_test will be performed 
+      with max_lr set to min_loss_lr and min_lr set to max_grad_lr
+    """
+    if max_lr is None or min_lr is None:
+      max_grad_lr, min_loss_lr = self.lr_range_test(end_lr=1,
+                                                    num_iter=100,
+                                                    step_mode="exp",
+                                                    show_graph=False)
+      if max_lr is None: max_lr = min_loss_lr
+      if min_lr is None: min_lr = max_grad_lr
+    
     print(f"Max LR: {max_lr:.1E} | Min LR: {min_lr:.1E}")
     pervious_optimizer = deepcopy(self.optimizer)
     self.set_lr(min_lr)
@@ -364,15 +407,39 @@ class TSEngine:
     self.optimizer = pervious_optimizer
 
   def set_clip_grad_value(self, clip_value):
+    """Method to perform Value Clipping
+    Clips gradietns element-wise so that they stay inside the [-clip_value, +clip_value]
+    Reference: https://pytorch.org/docs/stable/generated/torch.nn.utils.clip_grad_value_.html
+    Executed in GradientClipping Callback
+    Args:
+      clip_value [float]: max and min gradient value
+    """
     self.clipping = lambda: nn.utils.clip_grad_value_(self.model.parameters(),
                                                       clip_value=clip_value)
 
   def set_clip_grad_norm(self, max_norm, norm_type=2):
+    """Method to perform Norm Clipping
+    Norm clipping computes the norm for all gradeints together if they were concatedated into a single vector
+    if the norm exceeds teh clipping value, teh gradients are scaled down to match the desired norm
+    Reference: https://pytorch.org/docs/stable/generated/torch.nn.utils.clip_grad_norm_.html
+    Executed in GradientClipping Callback
+
+    Args:
+      max_norm [float]: max norm of the gradients
+      norm_type [float]: type of the used p-norm. Can be 'inf' for infinity norm
+    """
     self.clipping = lambda: nn.utils.clip_grad_norm_(self.model.parameters(),
                                                      max_norm=max_norm,
                                                      norm_type=norm_type)
 
   def set_clip_backprop(self, clip_value):
+    """Method to set clip gradient on the fly using backward hook (register_hook)
+    clamp all grad using torch.clamp between [-clip_value, +clip_value]
+
+    Args:
+      clip_value [float]: max and min gradient value
+    
+    """
     if self.clipping is None:
       self.clipping = []
     for p in self.model.parameters():
@@ -383,10 +450,45 @@ class TSEngine:
         self.clipping.append(handle)
 
   def remove_clip(self):
+    """Method to remove gradient clipping in backward hook"""
     if isinstance(self.clipping, list):
       for handle in self.clipping:
         handle.remove()
     self.clipping = None
+
+  def attach_forward_hooks(self, layers_to_hook, hook_fn):
+    """Method to attach custom forward hooks
+    
+    Args:
+      layers_to_hook [list]: list of layers to hook
+      hook_fn [Callable]: custom hook_fn in during forward pass
+    """
+    for name, layer in self.modules:
+      if name in layers_to_hook:
+        handle = layer.register_forward_hook(hook_fn)
+        self.forward_hook_handles.append(handle)
+
+  def attach_backward_hooks(self, layers_to_hook, hook_fn):
+    """Method to attach custom backward hooks
+    
+    Args:
+      layers_to_hook [list]: list of layers to hook
+      hook_fn [Callable]: custom hook_fn in during backward pass
+    """
+    for name, layer in self.modules:
+      if name in layers_to_hook:
+        handle = layer.register_full_backward_hook(hook_fn)
+        self.backward_hook_handles.append(handle)
+
+  def remove_hooks(self):
+    """Method to remove both custom forward and backward hook"""
+    for handle in self.forward_hook_handles:
+      handle.remove()
+    self.forward_hook_handles = []
+    for handle in self.backward_hook_handles:
+      handle.remove()
+    self.backward_hook_handles = []
+
 
   class Callback:
     def __init__(self, **kwargs): pass
