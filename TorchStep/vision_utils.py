@@ -162,7 +162,16 @@ def get_cam(img_path: str,
             classifier: Callable,
             layers_to_activate: list,
             class_to_activate: int):
-  """Method to get Class Activation Maps(CAM) for in image"""
+  """Method to get Class Activation Maps(CAM) for in image
+  
+  Args:
+    img_path [str]: path of img to be analysed
+    tfms [transforms]: transform of image, PIL to Tensor
+    rtfms [transforms]: reverse transform of image, Tensor to PIL
+    classifier [TSEngine]: TSEngine class classifier
+    layers_to_activate [list]: layers to get activation from model in classifier
+    class_to_activate [int]: class for Class Activation Maps (CAM) analysis
+  """
   gradients = None
   activations = None
 
@@ -182,6 +191,7 @@ def get_cam(img_path: str,
   # Open image and perform forward and backward pass on class to activates
   img = tfms(Image.open(img_path).convert('RGB'))
   y_logits = classifier.model(img.unsqueeze(dim=0).to('cuda'))
+  print(f'Prediction: {y_logits}')
   y_logits[class_to_activate].backward()
 
   # freeze classifier and remove hooks
